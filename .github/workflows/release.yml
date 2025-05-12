@@ -110,7 +110,7 @@ jobs:
       # Cross build
       - name: Install cross
         if: matrix.cross
-        run: cargo install --version cross
+        run: cargo install cross
       - name: Run tests
         if: matrix.cross
         run: cross test --release --target ${{ matrix.target }} --verbose --features embedded --no-default-features
