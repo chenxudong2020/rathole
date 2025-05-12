@@ -86,7 +86,7 @@ jobs:
         with:
           profile: minimal
           # Since rust 1.72, some platforms are tier 3
-          toolchain: 1.71
+          toolchain: 1.86
           default: true
       
       - name: Install OpenSSL
@@ -110,7 +110,7 @@ jobs:
       # Cross build
       - name: Install cross
         if: matrix.cross
-        run: cargo install --version 0.2.5 cross
+        run: cargo install --version cross
       - name: Run tests
         if: matrix.cross
         run: cross test --release --target ${{ matrix.target }} --verbose --features embedded --no-default-features
