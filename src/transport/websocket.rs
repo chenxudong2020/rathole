@@ -90,10 +90,11 @@ impl AsyncWrite for WebsocketTunnel {
             .map_err(|err| Error::new(ErrorKind::Other, err)))?;
 
         // 使用零拷贝技术减少内存分配
-       match Pin::new(&mut sw.inner).start_send(Message::Binary(Bytes::copy_from_slice(buf))) {
+        match Pin::new(&mut sw.inner).start_send(Message::Binary(Bytes::copy_from_slice(buf).to_vec())) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
             Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e))),
         }
+
 
 
     }
