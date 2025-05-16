@@ -94,7 +94,6 @@ impl AsyncWrite for WebsocketTunnel {
             ready!(Pin::new(&mut sw.inner)
                 .poll_ready(cx)
                 .map_err(|err| Error::new(ErrorKind::Other, err)))?;
-            let data = sw.write_buf.drain(..).collect::<Vec<_>>();
               // 使用零拷贝技术减少内存分配
 			   match Pin::new(&mut sw.inner).start_send(Message::Binary(buf.to_vec())) {
                     Ok(()) => Poll::Ready(Ok(buf.len())),
@@ -120,6 +119,11 @@ impl AsyncWrite for WebsocketTunnel {
             .poll_flush(cx)
             .map_err(|err| Error::new(ErrorKind::Other, err))
     }
+   fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+            self.poll_flush(cx)
+   }
+
+
 }
 
 #[derive(Debug)]
