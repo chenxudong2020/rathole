@@ -10,9 +10,9 @@ use bytes::Bytes;
 use futures_core::stream::Stream;
 use futures_sink::Sink;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::{TcpListener, TcpStream, ToSocketAdders};
-use tokio_tungsten::tungsten::protocol::{Message, WebSocketConfig};
-use tokio_tungsten::{accept_async_with_config, client_async_with_config, WebSocketStream};
+use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
+use tokio_tungstenite::{accept_async_with_config, client_async_with_config, WebSocketStream};
 use tokio_util::io::StreamReader;
 use url::Url;
 
@@ -138,7 +138,7 @@ impl Transport for WebsocketTransport {
     }
 
     fn hint(conn: &Self::Stream, opt: SocketOpts) {
-        opt.apply(conn.inner.get_ref().inner.get_ref().get_tcpstream())
+        opt.apply(conn.inner.get_ref().inner.get_ref().get_ref().get_tcpstream())
     }
 
     async fn bind<A: ToSocketAddrs + Send + Sync>(
