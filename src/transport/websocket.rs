@@ -4,15 +4,15 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Result as AnyhowResult};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_core::stream::Stream;
 use futures_sink::Sink;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
-use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
-use tokio_tungstenite::{accept_async_with_config, client_async_with_config, WebSocketStream};
+use tokio::net::{TcpListener, TcpStream, ToSocketAdders};
+use tokio_tungsten::tungsten::protocol::{Message, WebSocketConfig};
+use tokio_tungsten::{accept_async_with_config, client_async_with_config, WebSocketStream};
 use tokio_util::io::StreamReader;
 use url::Url;
 
@@ -89,7 +89,8 @@ impl AsyncWrite for WebsocketTunnel {
             .poll_ready(cx)
             .map_err(|err| Error::new(ErrorKind::Other, err)))?;
 
-        match Pin::new(&mut sw.inner).start_send(Message::Binary(buf.to_vec())) {
+        // 使用零拷贝技术减少内存分配
+        match Pin::new(&mut sw.inner).start_send(Message::Binary(Bytes::copy_from_slice(buf))) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
             Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e))),
         }
@@ -120,14 +121,16 @@ impl Transport for WebsocketTransport {
     type RawStream = TcpStream;
     type Stream = WebsocketTunnel;
 
-    fn new(config: &TransportConfig) -> anyhow::Result<Self> {
+    fn new(config: &TransportConfig) -> AnyhowResult<Self> {
         let wsconfig = config
             .websocket
             .as_ref()
             .ok_or_else(|| anyhow!("Missing websocket config"))?;
 
+        // 优化 WebSocket 配置
         let conf = WebSocketConfig {
-            write_buffer_size: 0,
+            write_buffer_size: 64 * 1024, // 设置写缓冲区大小为 64KB
+            max_message_size: Some(16 * 1024 * 1024), // 最大消息大小为 16MB
             ..WebSocketConfig::default()
         };
         let sub = MaybeTLSTransport::new_explicit(wsconfig.tls, config)?;
@@ -141,24 +144,24 @@ impl Transport for WebsocketTransport {
     async fn bind<A: ToSocketAddrs + Send + Sync>(
         &self,
         addr: A,
-    ) -> anyhow::Result<Self::Acceptor> {
+    ) -> AnyhowResult<Self::Acceptor> {
         self.sub.bind(addr).await
     }
 
-    async fn accept(&self, a: &Self::Acceptor) -> anyhow::Result<(Self::RawStream, SocketAddr)> {
+    async fn accept(&self, a: &Self::Acceptor) -> AnyhowResult<(Self::RawStream, SocketAddr)> {
         self.sub.accept(a).await
     }
 
-    async fn handshake(&self, conn: Self::RawStream) -> anyhow::Result<Self::Stream> {
-        let tsream = self.sub.handshake(conn).await?;
-        let wsstream = accept_async_with_config(tsream, Some(self.conf)).await?;
+    async fn handshake(&self, conn: Self::RawStream) -> AnyhowResult<Self::Stream> {
+        let tstream = self.sub.handshake(conn).await?;
+        let wsstream = accept_async_with_config(tstream, Some(self.conf)).await?;
         let tun = WebsocketTunnel {
             inner: StreamReader::new(StreamWrapper { inner: wsstream }),
         };
         Ok(tun)
     }
 
-    async fn connect(&self, addr: &AddrMaybeCached) -> anyhow::Result<Self::Stream> {
+    async fn connect(&self, addr: &AddrMaybeCached) -> AnyhowResult<Self::Stream> {
         let u = format!("ws://{}", &addr.addr.as_str());
         let url = Url::parse(&u).unwrap();
         let tstream = self.sub.connect(addr).await?;
