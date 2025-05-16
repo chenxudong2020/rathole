@@ -24,7 +24,7 @@ use crate::config::TransportConfig;
 struct StreamWrapper {
     inner: WebSocketStream<MaybeTLSStream>,
     write_buf: Vec<u8>, // 新增写缓冲区
-    max_size: 256 * 1024  //缓冲区的大小设置256KB
+    max_size: usize
 }
 
 impl Stream for StreamWrapper {
@@ -174,7 +174,7 @@ impl Transport for WebsocketTransport {
         let tstream = self.sub.handshake(conn).await?;
         let wsstream = accept_async_with_config(tstream, Some(self.conf)).await?;
         let tun = WebsocketTunnel {
-            inner: StreamReader::new(StreamWrapper { inner: wsstream }),
+            inner: StreamReader::new(StreamWrapper { inner: wsstream, write_buf: Vec::new(), max_size: 256 * 1024 }),
         };
         Ok(tun)
     }
@@ -187,7 +187,7 @@ impl Transport for WebsocketTransport {
             .await
             .expect("failed to connect");
         let tun = WebsocketTunnel {
-            inner: StreamReader::new(StreamWrapper { inner: wsstream }),
+            inner: StreamReader::new(StreamWrapper { inner: wsstream, write_buf: Vec::new(), max_size: 256 * 1024}),
         };
         Ok(tun)
     }
