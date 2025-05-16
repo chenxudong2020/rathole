@@ -138,7 +138,7 @@ impl Transport for WebsocketTransport {
     }
 
     fn hint(conn: &Self::Stream, opt: SocketOpts) {
-        opt.apply(conn.inner.get_ref().inner.get_ref().get_ref().get_tcpstream())
+        opt.apply(conn.inner.get_ref().inner.get_ref().get_tcpstream())
     }
 
     async fn bind<A: ToSocketAddrs + Send + Sync>(
