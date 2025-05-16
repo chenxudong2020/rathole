@@ -23,6 +23,8 @@ use crate::config::TransportConfig;
 #[derive(Debug)]
 struct StreamWrapper {
     inner: WebSocketStream<MaybeTLSStream>,
+    write_buf: Vec<u8>, // 新增写缓冲区
+    max_size: 256 * 1024  //缓冲区的大小设置256KB
 }
 
 impl Stream for StreamWrapper {
@@ -85,29 +87,37 @@ impl AsyncWrite for WebsocketTunnel {
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
         let sw = self.get_mut().inner.get_mut();
-        ready!(Pin::new(&mut sw.inner)
-            .poll_ready(cx)
-            .map_err(|err| Error::new(ErrorKind::Other, err)))?;
+        sw.write_buf.extend_from_slice(buf);
 
-        // 使用零拷贝技术减少内存分配
-        match Pin::new(&mut sw.inner).start_send(Message::Binary(Bytes::copy_from_slice(buf).to_vec())) {
-            Ok(()) => Poll::Ready(Ok(buf.len())),
-            Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e))),
+        // 当缓冲区达到阈值时发送
+        if sw.write_buf.len() >= sw.max_size {
+            ready!(Pin::new(&mut sw.inner)
+                .poll_ready(cx)
+                .map_err(|err| Error::new(ErrorKind::Other, err)))?;
+            let data = sw.write_buf.drain(..).collect::<Vec<_>>();
+              // 使用零拷贝技术减少内存分配
+			   match Pin::new(&mut sw.inner).start_send(Message::Binary(buf.to_vec())) {
+                    Ok(()) => Poll::Ready(Ok(buf.len())),
+                    Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e))),
+             }
+        } else {
+            Poll::Ready(Ok(buf.len()))
         }
-
-
-
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        Pin::new(&mut self.get_mut().inner.get_mut().inner)
+        let sw = self.get_mut().inner.get_mut();
+        if !sw.write_buf.is_empty() {
+            ready!(Pin::new(&mut sw.inner)
+                .poll_ready(cx)
+                .map_err(|err| Error::new(ErrorKind::Other, err)))?;
+            let data = sw.write_buf.drain(..).collect::<Vec<_>>();
+            if let Err(e) = Pin::new(&mut sw.inner).start_send(Message::Binary(data)) {
+                return Poll::Ready(Err(Error::new(ErrorKind::Other, e)));
+            }
+        }
+        Pin::new(&mut sw.inner)
             .poll_flush(cx)
-            .map_err(|err| Error::new(ErrorKind::Other, err))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        Pin::new(&mut self.get_mut().inner.get_mut().inner)
-            .poll_close(cx)
             .map_err(|err| Error::new(ErrorKind::Other, err))
     }
 }
@@ -133,8 +143,9 @@ impl Transport for WebsocketTransport {
         // 优化 WebSocket 配置
         let conf = WebSocketConfig {
             write_buffer_size: 256 * 1024, // 设置写缓冲区大小为 256KB
-            max_message_size: Some(64 * 1024 * 1024), // 最大消息大小为 64MB
+            max_message_size: Some(16 * 1024 * 1024), // 最大消息大小为 64MB
             accept_unmasked_frames: true, //启用未屏蔽帧以提高性能
+            max_frame_size: Some(64 * 1024),  // 设置最大帧大小
             ..WebSocketConfig::default()
         };
         let sub = MaybeTLSTransport::new_explicit(wsconfig.tls, config)?;
