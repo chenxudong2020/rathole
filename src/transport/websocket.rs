@@ -90,10 +90,11 @@ impl AsyncWrite for WebsocketTunnel {
             .map_err(|err| Error::new(ErrorKind::Other, err)))?;
 
         // 使用零拷贝技术减少内存分配
-        match Pin::new(&mut sw.inner).start_send(Message::Binary(buf.to_vec())) {
+       match Pin::new(&mut sw.inner).start_send(Message::Binary(Bytes::copy_from_slice(buf))) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
             Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e))),
         }
+
 
     }
 
@@ -130,8 +131,9 @@ impl Transport for WebsocketTransport {
 
         // 优化 WebSocket 配置
         let conf = WebSocketConfig {
-            write_buffer_size: 64 * 1024, // 设置写缓冲区大小为 64KB
-            max_message_size: Some(16 * 1024 * 1024), // 最大消息大小为 16MB
+            write_buffer_size: 256 * 1024, // 设置写缓冲区大小为 256KB
+            max_message_size: Some(64 * 1024 * 1024), // 最大消息大小为 64MB
+            accept_unmasked_frames: true, //启用未屏蔽帧以提高性能
             ..WebSocketConfig::default()
         };
         let sub = MaybeTLSTransport::new_explicit(wsconfig.tls, config)?;
@@ -154,6 +156,9 @@ impl Transport for WebsocketTransport {
     }
 
     async fn handshake(&self, conn: Self::RawStream) -> AnyhowResult<Self::Stream> {
+       // 优化 TCP_NODELAY 设置 (优化点)
+        conn.set_nodelay(true)?;
+
         let tstream = self.sub.handshake(conn).await?;
         let wsstream = accept_async_with_config(tstream, Some(self.conf)).await?;
         let tun = WebsocketTunnel {
