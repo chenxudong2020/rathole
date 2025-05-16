@@ -16,8 +16,8 @@ default = [
     "client",
     "native-tls",
     "noise",
-    "websocket-native-tls",
-    "http2-native-tls",
+    "websocket-rustls",
+    "http2-rustls",
     "hot-reload",
 ]
 
