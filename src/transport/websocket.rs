@@ -2,16 +2,16 @@ use core::result::Result;
 use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result as AnyhowResult};
 use async_trait::async_trait;
 use futures_core::stream::Stream;
-use futures_sink::Sink;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
-use tokio_tungstenite::{accept_async_with_config, client_async_with_config, WebSocketStream};
+use tokio_tungstenite::{accept_async_with_config, client_async_with_config, WebSocketStream, split::SplitSink};
 use tokio_util::io::StreamReader;
 use url::Url;
 use bytes::{Bytes, BytesMut};
@@ -19,45 +19,87 @@ use bytes::{Bytes, BytesMut};
 use super::maybe_tls::{MaybeTLSStream, MaybeTLSTransport};
 use super::{AddrMaybeCached, SocketOpts, Transport};
 use crate::config::TransportConfig;
+use futures_util::sink::SinkExt; // 提供 send(), flush() 等方法
+use futures_util::stream::StreamExt; // 提供 next(), etc.
+use tracing::info;
 
 #[derive(Debug)]
 struct StreamWrapper {
-    inner: WebSocketStream<MaybeTLSStream>,
-    write_buf: BytesMut, // 新增写缓冲区
-    max_size: usize
+    inner: SplitSink<WebSocketStream<MaybeTLSStream>, Message>,
+    write_buf: BytesMut,
+    max_size: usize,
 }
 
-impl Stream for StreamWrapper {
-    type Item = Result<Bytes, Error>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match Pin::new(&mut self.get_mut().inner).poll_next(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Ready(Some(Err(err))) => {
-                Poll::Ready(Some(Err(Error::new(ErrorKind::Other, err))))
-            }
-            Poll::Ready(Some(Ok(res))) => {
-                if let Message::Binary(b) = res {
-                    Poll::Ready(Some(Ok(Bytes::from(b))))
-                } else {
-                    Poll::Ready(Some(Err(Error::new(
-                        ErrorKind::InvalidData,
-                        "unexpected frame",
-                    ))))
-                }
-            }
+impl StreamWrapper {
+    fn new(stream: WebSocketStream<MaybeTLSStream>) -> Self {
+        let (sink, _) = stream.split();
+        StreamWrapper {
+            inner: sink,
+            write_buf: BytesMut::new(),
+            max_size: 256 * 1024,
         }
     }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
+    async fn send_pending(&mut self) -> Result<(), Error> {
+        if !self.write_buf.is_empty() {
+            let data = std::mem::take(&mut self.write_buf);
+            self.inner.send(Message::Binary(data.to_vec())).await.map_err(|e| {
+                Error::new(ErrorKind::Other, e)
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl AsyncWrite for StreamWrapper {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        let this = self.get_mut();
+        this.write_buf.extend_from_slice(buf);
+
+        if this.write_buf.len() >= this.max_size {
+            ready!(Pin::new(&mut this.inner).poll_ready(cx).map_err(|err| Error::new(ErrorKind::Other, err)))?;
+            let data = std::mem::take(&mut this.write_buf);
+            match Pin::new(&mut this.inner).start_send(Message::Binary(data.to_vec())) {
+                Ok(()) => Poll::Ready(Ok(buf.len())),
+                Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e))),
+            }
+        } else {
+            Poll::Ready(Ok(buf.len()))
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        let this = self.get_mut();
+        ready!(Pin::new(&mut this.inner).poll_ready(cx).map_err(|err| Error::new(ErrorKind::Other, err)))?;
+        if !this.write_buf.is_empty() {
+            let data = std::mem::take(&mut this.write_buf);
+            if let Err(e) = Pin::new(&mut this.inner).start_send(Message::Binary(data)) {
+                return Poll::Ready(Err(Error::new(ErrorKind::Other, e)));
+            }
+        }
+        Pin::new(&mut this.inner).poll_flush(cx).map_err(|err| Error::new(ErrorKind::Other, err))
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        let this = self.get_mut();
+        ready!(Pin::new(&mut this.inner).poll_ready(cx).map_err(|err| Error::new(ErrorKind::Other, err)))?;
+        Pin::new(&mut this.inner).poll_close(cx).map_err(|err| Error::new(ErrorKind::Other, err))
     }
 }
 
 #[derive(Debug)]
 pub struct WebsocketTunnel {
-    inner: StreamReader<StreamWrapper, Bytes>,
+    inner: StreamReader<WebSocketStream<MaybeTLSStream>>,
 }
 
 impl AsyncRead for WebsocketTunnel {
@@ -86,42 +128,22 @@ impl AsyncWrite for WebsocketTunnel {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
-        let sw = self.get_mut().inner.get_mut();
-        sw.write_buf.extend_from_slice(buf);
-
-             // 当缓冲区达到阈值时发送
-             if sw.write_buf.len() >= sw.max_size {
-                 ready!(Pin::new(&mut sw.inner).poll_ready(cx).map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err)))?;
-                 // 修改点：发送缓冲区数据而不是直接发送传入的 buf
-                 let data = std::mem::take(&mut sw.write_buf);
-                 match Pin::new(&mut sw.inner).start_send(Message::Binary(data.to_vec())) {
-                     Ok(()) => Poll::Ready(Ok(buf.len())),
-                     Err(e) => Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e))),
-                 }
-             } else {
-                 Poll::Ready(Ok(buf.len()))
-             }
+        unimplemented!("Use StreamWrapper for writing")
     }
 
-   fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        let sw = self.get_mut().inner.get_mut();
-        if !sw.write_buf.is_empty() {
-            ready!(Pin::new(&mut sw.inner).poll_ready(cx).map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err)))?;
-            let data = std::mem::take(&mut sw.write_buf).to_vec(); // 修改点：在 flush 时发送剩余的数据
-            if let Err(e) = Pin::new(&mut sw.inner).start_send(Message::Binary(data)) {
-                return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
-            }
-        }
-        Pin::new(&mut sw.inner).poll_flush(cx).map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        let sw = self.get_mut().inner.get_mut();
-        ready!(Pin::new(&mut sw.inner).poll_ready(cx).map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err)))?;
-        Pin::new(&mut sw.inner).poll_close(cx).map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Poll::Ready(Ok(()))
     }
-
-
 }
 
 #[derive(Debug)]
@@ -142,20 +164,22 @@ impl Transport for WebsocketTransport {
             .as_ref()
             .ok_or_else(|| anyhow!("Missing websocket config"))?;
 
-        // 优化 WebSocket 配置
         let conf = WebSocketConfig {
-            write_buffer_size: 256 * 1024, // 设置写缓冲区大小为 256KB
-            max_message_size: Some(16 * 1024 * 1024), // 最大消息大小为 64MB
-            accept_unmasked_frames: true, //启用未屏蔽帧以提高性能
-            max_frame_size: Some(64 * 1024),  // 设置最大帧大小
+            write_buffer_size: 256 * 1024,
+            max_message_size: Some(16 * 1024 * 1024),
+            accept_unmasked_frames: true,
+            max_frame_size: Some(64 * 1024),
             ..WebSocketConfig::default()
         };
+
         let sub = MaybeTLSTransport::new_explicit(wsconfig.tls, config)?;
         Ok(WebsocketTransport { sub, conf })
     }
 
     fn hint(conn: &Self::Stream, opt: SocketOpts) {
-        opt.apply(conn.inner.get_ref().inner.get_ref().get_tcpstream())
+        if let Some(tcp) = conn.inner.get_ref().get_ref().get_tcpstream() {
+            opt.apply(tcp)
+        }
     }
 
     async fn bind<A: ToSocketAddrs + Send + Sync>(
@@ -170,14 +194,26 @@ impl Transport for WebsocketTransport {
     }
 
     async fn handshake(&self, conn: Self::RawStream) -> AnyhowResult<Self::Stream> {
-       // 优化 TCP_NODELAY 设置 (优化点)
         conn.set_nodelay(true)?;
-
         let tstream = self.sub.handshake(conn).await?;
         let wsstream = accept_async_with_config(tstream, Some(self.conf)).await?;
-        spawn_heartbeat(wsstream.clone());
+
+        // 分离出写入端用于心跳
+        let (mut sink, stream) = wsstream.split();
+
+        // 启动心跳任务
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                if sink.send(Message::Ping(vec![0x13, 0x37])).await.is_err() {
+                    info!("Heartbeat failed, closing connection.");
+                    break;
+                }
+            }
+        });
+
         let tun = WebsocketTunnel {
-            inner: StreamReader::new(StreamWrapper { inner: wsstream, write_buf: BytesMut::new(), max_size: 256 * 1024 }),
+            inner: StreamReader::new(stream),
         };
         Ok(tun)
     }
@@ -189,22 +225,12 @@ impl Transport for WebsocketTransport {
         let (wsstream, _) = client_async_with_config(url, tstream, Some(self.conf))
             .await
             .expect("failed to connect");
+
+        let (_, stream) = wsstream.split();
+
         let tun = WebsocketTunnel {
-            inner: StreamReader::new(StreamWrapper { inner: wsstream, write_buf: BytesMut::new(), max_size: 256 * 1024}),
+            inner: StreamReader::new(stream),
         };
         Ok(tun)
     }
-
-    async fn spawn_heartbeat(mut wsstream: WebSocketStream<MaybeTLSStream>) {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            if wsstream.send(Message::Ping(vec![0x13, 0x37])).await.is_err() {
-                tracing::info!("WebSocket heartbeat failed, closing connection.");
-                break;
-            }
-        }
-     });
-  }
-
 }
