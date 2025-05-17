@@ -6,7 +6,6 @@ use std::task::{ready, Context, Poll};
 
 use anyhow::{anyhow, Result as AnyhowResult};
 use async_trait::async_trait;
-use bytes::Bytes;
 use futures_core::stream::Stream;
 use futures_sink::Sink;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
@@ -15,6 +14,7 @@ use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_tungstenite::{accept_async_with_config, client_async_with_config, WebSocketStream};
 use tokio_util::io::StreamReader;
 use url::Url;
+use bytes::{Bytes, BytesMut};
 
 use super::maybe_tls::{MaybeTLSStream, MaybeTLSTransport};
 use super::{AddrMaybeCached, SocketOpts, Transport};
