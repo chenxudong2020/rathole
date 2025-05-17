@@ -15,6 +15,7 @@ use tokio_tungstenite::{accept_async_with_config, client_async_with_config, WebS
 use tokio_util::io::StreamReader;
 use url::Url;
 use bytes::{Bytes, BytesMut};
+use pin_project::pin_project;
 
 use super::maybe_tls::{MaybeTLSStream, MaybeTLSTransport};
 use super::{AddrMaybeCached, SocketOpts, Transport};
@@ -49,18 +50,21 @@ impl Stream for StreamWrapper {
     }
 }
 
+#[pin_project]
 #[derive(Debug)]
 pub struct WebsocketTunnel {
+    #[pin]
     inner: StreamReader<StreamWrapper, Bytes>,
 }
 
 impl AsyncRead for WebsocketTunnel {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        let this = self.project();
+        this.inner.poll_read(cx, buf)
     }
 }
 
