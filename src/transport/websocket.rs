@@ -23,7 +23,7 @@ use crate::config::TransportConfig;
 #[derive(Debug)]
 struct StreamWrapper {
     inner: WebSocketStream<MaybeTLSStream>,
-    write_buf: Vec<u8>, // 新增写缓冲区
+    write_buf: BytesMut, // 新增写缓冲区
     max_size: usize
 }
 
@@ -89,39 +89,37 @@ impl AsyncWrite for WebsocketTunnel {
         let sw = self.get_mut().inner.get_mut();
         sw.write_buf.extend_from_slice(buf);
 
-        // 当缓冲区达到阈值时发送
-        if sw.write_buf.len() >= sw.max_size {
-            ready!(Pin::new(&mut sw.inner)
-                .poll_ready(cx)
-                .map_err(|err| Error::new(ErrorKind::Other, err)))?;
-              // 使用零拷贝技术减少内存分配
-			   match Pin::new(&mut sw.inner).start_send(Message::Binary(buf.to_vec())) {
-                    Ok(()) => Poll::Ready(Ok(buf.len())),
-                    Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e))),
+             // 当缓冲区达到阈值时发送
+             if sw.write_buf.len() >= sw.max_size {
+                 ready!(Pin::new(&mut sw.inner).poll_ready(cx).map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err)))?;
+                 // 修改点：发送缓冲区数据而不是直接发送传入的 buf
+                 let data = std::mem::take(&mut sw.write_buf);
+                 match Pin::new(&mut sw.inner).start_send(Message::Binary(data.to_vec())) {
+                     Ok(()) => Poll::Ready(Ok(buf.len())),
+                     Err(e) => Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e))),
+                 }
+             } else {
+                 Poll::Ready(Ok(buf.len()))
              }
-        } else {
-            Poll::Ready(Ok(buf.len()))
-        }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+   fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
         let sw = self.get_mut().inner.get_mut();
         if !sw.write_buf.is_empty() {
-            ready!(Pin::new(&mut sw.inner)
-                .poll_ready(cx)
-                .map_err(|err| Error::new(ErrorKind::Other, err)))?;
-            let data = sw.write_buf.drain(..).collect::<Vec<_>>();
+            ready!(Pin::new(&mut sw.inner).poll_ready(cx).map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err)))?;
+            let data = std::mem::take(&mut sw.write_buf).to_vec(); // 修改点：在 flush 时发送剩余的数据
             if let Err(e) = Pin::new(&mut sw.inner).start_send(Message::Binary(data)) {
-                return Poll::Ready(Err(Error::new(ErrorKind::Other, e)));
+                return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
             }
         }
-        Pin::new(&mut sw.inner)
-            .poll_flush(cx)
-            .map_err(|err| Error::new(ErrorKind::Other, err))
+        Pin::new(&mut sw.inner).poll_flush(cx).map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
     }
-   fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-            self.poll_flush(cx)
-   }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        let sw = self.get_mut().inner.get_mut();
+        ready!(Pin::new(&mut sw.inner).poll_ready(cx).map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err)))?;
+        Pin::new(&mut sw.inner).poll_close(cx).map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
+    }
 
 
 }
@@ -178,7 +176,7 @@ impl Transport for WebsocketTransport {
         let tstream = self.sub.handshake(conn).await?;
         let wsstream = accept_async_with_config(tstream, Some(self.conf)).await?;
         let tun = WebsocketTunnel {
-            inner: StreamReader::new(StreamWrapper { inner: wsstream, write_buf: Vec::new(), max_size: 256 * 1024 }),
+            inner: StreamReader::new(StreamWrapper { inner: wsstream, write_buf: BytesMut::new(), max_size: 256 * 1024 }),
         };
         Ok(tun)
     }
@@ -191,7 +189,7 @@ impl Transport for WebsocketTransport {
             .await
             .expect("failed to connect");
         let tun = WebsocketTunnel {
-            inner: StreamReader::new(StreamWrapper { inner: wsstream, write_buf: Vec::new(), max_size: 256 * 1024}),
+            inner: StreamReader::new(StreamWrapper { inner: wsstream, write_buf: BytesMut::new(), max_size: 256 * 1024}),
         };
         Ok(tun)
     }
