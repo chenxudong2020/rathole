@@ -2,7 +2,7 @@ use core::result::Result;
 use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready}; // 引入 ready! 宏
 use std::time::Duration;
 
 use anyhow::{anyhow, Result as AnyhowResult};
@@ -11,17 +11,20 @@ use futures_core::stream::Stream;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
-use tokio_tungstenite::{accept_async_with_config, client_async_with_config, WebSocketStream, split::SplitSink};
+use tokio_tungstenite::{accept_async_with_config, client_async_with_config, WebSocketStream};
 use tokio_util::io::StreamReader;
 use url::Url;
-use bytes::{Bytes, BytesMut};
+use bytes::{BytesMut};
 
 use super::maybe_tls::{MaybeTLSStream, MaybeTLSTransport};
 use super::{AddrMaybeCached, SocketOpts, Transport};
 use crate::config::TransportConfig;
-use futures_util::sink::SinkExt; // 提供 send(), flush() 等方法
-use futures_util::stream::StreamExt; // 提供 next(), etc.
-use tracing::info;
+
+// 必须引入这些 trait 才能使用 split() / send()
+use futures_util::{
+    stream::StreamExt, // 提供 .split()
+    sink::SinkExt,     // 提供 .send(), .flush()
+};
 
 #[derive(Debug)]
 struct StreamWrapper {
@@ -80,7 +83,7 @@ impl AsyncWrite for StreamWrapper {
         ready!(Pin::new(&mut this.inner).poll_ready(cx).map_err(|err| Error::new(ErrorKind::Other, err)))?;
         if !this.write_buf.is_empty() {
             let data = std::mem::take(&mut this.write_buf);
-            if let Err(e) = Pin::new(&mut this.inner).start_send(Message::Binary(data)) {
+            if let Err(e) = Pin::new(&mut this.inner).start_send(Message::Binary(data.to_vec())) {
                 return Poll::Ready(Err(Error::new(ErrorKind::Other, e)));
             }
         }
@@ -99,7 +102,7 @@ impl AsyncWrite for StreamWrapper {
 
 #[derive(Debug)]
 pub struct WebsocketTunnel {
-    inner: StreamReader<WebSocketStream<MaybeTLSStream>>,
+    inner: StreamReader<StreamWrapper, BytesMut>,
 }
 
 impl AsyncRead for WebsocketTunnel {
@@ -119,30 +122,6 @@ impl AsyncBufRead for WebsocketTunnel {
 
     fn consume(self: Pin<&mut Self>, amt: usize) {
         Pin::new(&mut self.get_mut().inner).consume(amt)
-    }
-}
-
-impl AsyncWrite for WebsocketTunnel {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        unimplemented!("Use StreamWrapper for writing")
-    }
-
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        Poll::Ready(Ok(()))
     }
 }
 
@@ -177,7 +156,7 @@ impl Transport for WebsocketTransport {
     }
 
     fn hint(conn: &Self::Stream, opt: SocketOpts) {
-        if let Some(tcp) = conn.inner.get_ref().get_ref().get_tcpstream() {
+        if let Some(tcp) = conn.inner.get_ref().get_ref().inner.get_ref().get_tcpstream() {
             opt.apply(tcp)
         }
     }
@@ -198,22 +177,20 @@ impl Transport for WebsocketTransport {
         let tstream = self.sub.handshake(conn).await?;
         let wsstream = accept_async_with_config(tstream, Some(self.conf)).await?;
 
-        // 分离出写入端用于心跳
         let (mut sink, stream) = wsstream.split();
 
-        // 启动心跳任务
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 if sink.send(Message::Ping(vec![0x13, 0x37])).await.is_err() {
-                    info!("Heartbeat failed, closing connection.");
+                    tracing::info!("Heartbeat failed, closing connection.");
                     break;
                 }
             }
         });
 
         let tun = WebsocketTunnel {
-            inner: StreamReader::new(stream),
+            inner: StreamReader::new(StreamWrapper::new(stream)),
         };
         Ok(tun)
     }
@@ -226,10 +203,20 @@ impl Transport for WebsocketTransport {
             .await
             .expect("failed to connect");
 
-        let (_, stream) = wsstream.split();
+        let (mut sink, stream) = wsstream.split();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                if sink.send(Message::Ping(vec![0x13, 0x37])).await.is_err() {
+                    tracing::info!("Heartbeat failed, closing connection.");
+                    break;
+                }
+            }
+        });
 
         let tun = WebsocketTunnel {
-            inner: StreamReader::new(stream),
+            inner: StreamReader::new(StreamWrapper::new(stream)),
         };
         Ok(tun)
     }
