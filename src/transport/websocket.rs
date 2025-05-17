@@ -175,6 +175,7 @@ impl Transport for WebsocketTransport {
 
         let tstream = self.sub.handshake(conn).await?;
         let wsstream = accept_async_with_config(tstream, Some(self.conf)).await?;
+        spawn_heartbeat(wsstream.clone());
         let tun = WebsocketTunnel {
             inner: StreamReader::new(StreamWrapper { inner: wsstream, write_buf: BytesMut::new(), max_size: 256 * 1024 }),
         };
@@ -193,4 +194,17 @@ impl Transport for WebsocketTransport {
         };
         Ok(tun)
     }
+
+    async fn spawn_heartbeat(mut wsstream: WebSocketStream<MaybeTLSStream>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            if wsstream.send(Message::Ping(vec![0x13, 0x37])).await.is_err() {
+                tracing::info!("WebSocket heartbeat failed, closing connection.");
+                break;
+            }
+        }
+     });
+  }
+
 }
