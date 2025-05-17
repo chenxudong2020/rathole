@@ -69,22 +69,28 @@ impl AsyncRead for WebsocketTunnel {
 }
 
 impl AsyncBufRead for WebsocketTunnel {
-    fn poll_fill_buf(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<&[u8]>> {
-        Pin::new(&mut self.inner).poll_fill_buf(cx)
+    fn poll_fill_buf(
+        self: Pin<&mut Self>, 
+        cx: &mut Context<'_>
+    ) -> Poll<std::io::Result<&[u8]>> {
+        let this = self.project();
+        this.inner.poll_fill_buf(cx)
     }
 
-    fn consume(mut self: Pin<&mut Self>, amt: usize) {
-        Pin::new(&mut self.inner).consume(amt)
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        let this = self.project();
+        this.inner.consume(amt)
     }
 }
 
 impl AsyncWrite for WebsocketTunnel {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
-        let sw = &mut self.inner.get_mut();
+        let this = self.project();
+        let sw = &mut this.inner.get_mut();
         sw.write_buf.extend_from_slice(buf);
 
         while !sw.write_buf.is_empty() {
@@ -95,15 +101,17 @@ impl AsyncWrite for WebsocketTunnel {
             let chunk = sw.write_buf.split_to(chunk_size).freeze();
 
             Pin::new(&mut sw.inner)
-                .start_send(Message::Binary(chunk.to_vec()))
+                .start_send(Message::Binary(chunk.into()))
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         }
 
         Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        let sw = &mut self.inner.get_mut();
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        
+        let this = self.project();
+        let sw = &mut this.inner.get_mut();
 
         while !sw.write_buf.is_empty() {
             ready!(Pin::new(&mut sw.inner).poll_ready(cx)
@@ -123,10 +131,11 @@ impl AsyncWrite for WebsocketTunnel {
     }
 
     fn poll_shutdown(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.inner.get_mut().inner)
+        let this = self.project();
+        Pin::new(&mut this.inner.get_mut().inner)
             .poll_close(cx)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     }
